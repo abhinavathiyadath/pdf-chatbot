@@ -29,6 +29,30 @@ def load_database():
 
 db = load_database()
 
+# Step 7: Retrieve relevant chunks
+def retrieve_chunks(question, top_k=3):
+    # Load the embedding model
+    model = load_embedding_model()
+
+    # Convert the question into a vector
+    question_embedding = model.encode(
+        [question],
+        normalize_embeddings=True
+    ).tolist()
+
+    # Access the stored PDF chunks
+    collection = db.get_collection("pdf_documents")
+
+    # Search for the most relevant chunks
+    results = collection.query(
+        query_embeddings=question_embedding,
+        n_results=min(top_k, collection.count()),
+        include=["documents", "metadatas", "distances"]
+    )
+
+    return results
+
+
 
 # 3. Split text into chunks
 def split_into_chunks(text, chunk_size=100, overlap=20):
@@ -164,5 +188,43 @@ if uploaded_file is not None:
                     st.write("Metadata:")
                     st.json(stored_data["metadatas"][0])
 
+                    
+                    # Step 8: Search the stored PDF
+                    st.subheader("Ask a question about your PDF")
+
+                    question = st.text_input(
+                        "Enter your question",
+                        key="retrieval_question"
+                    )
+
+                    if st.button("Find relevant passages"):
+                        if question.strip():
+                            try:
+                                results = retrieve_chunks(question)
+
+                                st.success("Retrieved relevant passages!")
+
+                                for i, text in enumerate(
+                                    results["documents"][0],
+                                    start=1
+                                ):
+                                    metadata = results["metadatas"][0][i - 1]
+                                    distance = results["distances"][0][i - 1]
+
+                                    st.markdown(f"### Result {i}")
+                                    st.write(text)
+                                    st.caption(
+                                        f"Source: {metadata['source']} | "
+                                        f"Chunk: {metadata['chunk_number']} | "
+                                        f"Cosine distance: {distance:.4f}"
+                                    )
+
+                            except Exception as error:
+                                st.error(f"Retrieval failed: {error}")
+                        else:
+                            st.warning("Please enter a question.")
+
+
             except Exception as error:
                 st.error(f"Could not read stored data: {error}")
+
