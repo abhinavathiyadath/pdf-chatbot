@@ -1,7 +1,8 @@
 import re
 import streamlit as st
 import pymupdf as fitz
-import ollama
+import os
+from groq import Groq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
@@ -109,7 +110,7 @@ def retrieve_chunks(question, top_k=3, db_client=None):
 
     return results
 
-# 9. Generate an answer with Ollama using only the retrieved context
+# 9. Generate an answer with Groq using only the retrieved context
 def generate_answer(question, context):
     prompt = f"""
     You are a helpful assistant answering questions about a PDF study material.
@@ -127,17 +128,18 @@ def generate_answer(question, context):
     Answer:
     """
 
-    response = ollama.chat(
-        model="llama3.2",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+    api_key = st.secrets.get("GROQ_API_KEY") if "GROQ_API_KEY" in st.secrets else os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY is missing. Add it in Streamlit app Settings → Secrets.")
+
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
     )
 
-    return response["message"]["content"]
+    return response.choices[0].message.content
 
 # UI styling: keep the Learnly AI design separate from the RAG logic
 def inject_learnly_theme():
@@ -296,8 +298,8 @@ def main():
         st.session_state["last_answer"] = None
     if "last_results" not in st.session_state:
         st.session_state["last_results"] = None
-    if "ollama_error" not in st.session_state:
-        st.session_state["ollama_error"] = None
+    if "generation_error" not in st.session_state:
+        st.session_state["generation_error"] = None
     if "indexed_filename" not in st.session_state:
         st.session_state["indexed_filename"] = None
 
@@ -432,7 +434,7 @@ def main():
         else:
             st.session_state["last_answer"] = None
             st.session_state["last_results"] = None
-            st.session_state["ollama_error"] = None
+            st.session_state["generation_error"] = None
 
             collection = get_existing_collection(db, COLLECTION_NAME)
             if collection is None:
@@ -460,7 +462,7 @@ def main():
                                 answer = generate_answer(cleaned_question, context)
                                 st.session_state["last_answer"] = answer
                             except Exception as ollama_err:
-                                st.session_state["ollama_error"] = str(ollama_err)
+                                st.session_state["generation_error"] = str(ollama_err)
 
                 except Exception as retrieval_error:
                     st.error(f"❌ Search failed: {retrieval_error}")
@@ -479,22 +481,10 @@ def main():
             st.markdown(st.session_state["last_answer"])
         st.write("")
 
-    elif st.session_state.get("ollama_error"):
-        err_str = st.session_state["ollama_error"]
+    elif st.session_state.get("generation_error"):
+        err_str = st.session_state["generation_error"]
         st.markdown("### 💡 Answer")
-        if "connect" in err_str.lower() or "connection" in err_str.lower() or "11434" in err_str:
-            st.error(
-                "⚠️ **Could not connect to Ollama.**\n\n"
-                "Please make sure the Ollama service is running locally (`ollama serve`). "
-                "Retrieved passages from your study material are still displayed below."
-            )
-        elif "not found" in err_str.lower() or "model" in err_str.lower():
-            st.error(
-                "⚠️ **Llama 3.2 model not found in Ollama.**\n\n"
-                "Please run `ollama pull llama3.2` to download the model."
-            )
-        else:
-            st.error(f"⚠️ **Generation error:** {err_str}")
+        st.error(f"⚠️ **Answer generation failed:** {err_str}")
 
     results = st.session_state.get("last_results")
     if results and results.get("documents") and len(results["documents"]) > 0:
