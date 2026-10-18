@@ -1,6 +1,5 @@
 # Learnly AI
 
-**Your study materials. Smarter answers.**
 
 Learnly AI is an AI-powered PDF study assistant that lets you upload study materials, ask questions, and receive answers grounded in retrieved passages, with source page references.
 
