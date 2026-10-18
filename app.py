@@ -1,6 +1,7 @@
 
 import streamlit as st
 import fitz
+import ollama
 import chromadb
 from sentence_transformers import SentenceTransformer
 
@@ -28,6 +29,35 @@ def load_database():
 
 
 db = load_database()
+# Step 9: Generate an answer using Ollama
+def generate_answer(question, context):
+    prompt = f"""
+    You are a helpful assistant answering questions about a PDF.
+
+    Answer using only the context provided below.
+    If the answer is not present in the context,
+    say that you could not find the answer in the PDF.
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+
+    Answer:
+    """
+
+    response = ollama.chat(
+        model="llama3.2",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    return response["message"]["content"]
 
 # Step 7: Retrieve relevant chunks
 def retrieve_chunks(question, top_k=3):
@@ -201,6 +231,15 @@ if uploaded_file is not None:
                         if question.strip():
                             try:
                                 results = retrieve_chunks(question)
+                                # Combine retrieved passages into one context
+                                context = "\n\n".join(results["documents"][0])
+
+                                # Generate an answer from the retrieved context
+                                with st.spinner("Generating answer with Ollama..."):
+                                    answer = generate_answer(question, context)
+
+                                st.subheader("🤖 AI Answer")
+                                st.write(answer)
 
                                 st.success("Retrieved relevant passages!")
 
@@ -227,4 +266,3 @@ if uploaded_file is not None:
 
             except Exception as error:
                 st.error(f"Could not read stored data: {error}")
-
