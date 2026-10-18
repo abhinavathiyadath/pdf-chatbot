@@ -202,7 +202,3 @@ AI-assisted development tools were used to help refine the user interface, inclu
 **Abhinav**
 
 Developed as a project exploring Retrieval-Augmented Generation, semantic search, local LLMs, and AI-assisted study tools.
-
----
-
-*Learnly AI — Your study materials. Smarter answers.*
