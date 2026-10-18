@@ -1,42 +1,122 @@
-
+import re
 import streamlit as st
-import fitz
+import pymupdf as fitz
 import ollama
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-st.set_page_config(
-    page_title="My RAG Project",
-    page_icon="📚"
-)
+# 1. Name of the ChromaDB collection used to store PDF chunks
+COLLECTION_NAME = "pdf_documents"
 
-st.title("📚 My First RAG Project")
-st.write("Extract, chunk, embed, and store PDF text.")
-
-
-# 1. Load the embedding model
+# 2. Load the embedding model (cached so it is not reloaded on every rerun)
 @st.cache_resource
 def load_embedding_model():
-    return SentenceTransformer(
-        "sentence-transformers/all-MiniLM-L6-v2"
-    )
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-
-# 2. Create a persistent ChromaDB database
+# 3. Create a persistent ChromaDB database
 @st.cache_resource
 def load_database():
     return chromadb.PersistentClient(path="./chroma_db")
 
+# Check whether the PDF collection already exists in ChromaDB
+def get_existing_collection(client, collection_name=COLLECTION_NAME):
+    try:
+        return client.get_collection(name=collection_name)
+    except Exception:
+        return None
 
-db = load_database()
-# Step 9: Generate an answer using Ollama
+# Clean extracted PDF text by removing invisible characters and fixing spacing
+def clean_pdf_text(text: str) -> str:
+    if not text:
+        return ""
+
+    text = (
+        text.replace("\x00", "")
+        .replace("\x0c", "\n")
+        .replace("\xa0", " ")
+        .replace("\u200b", "")
+        .replace("\ufeff", "")
+    )
+
+    text = text.replace("\uf0b7", "•").replace("\uf0a7", "•").replace("\uf0d8", "•")
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    text = re.sub(r"(\b[A-Za-z]+)-\s*\n\s*([a-z]+)\b", r"\1\2", text)
+
+    text = re.sub(r"(\b[A-Za-z]+)-\s+([A-Za-z]+\b)", r"\1-\2", text)
+
+    text = re.sub(r"[^\S\n]+", " ", text)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    lines = [line.strip() for line in text.split("\n")]
+    return "\n".join(lines).strip()
+
+# 4. Split text into overlapping chunks while preserving each page number
+def create_page_chunks(page_texts, chunk_size=100, overlap=20):
+    chunks = []
+
+    for page_number, page_text in enumerate(page_texts, start=1):
+        words = page_text.split()
+        if not words:
+            continue
+
+        start = 0
+        while start < len(words):
+            end = start + chunk_size
+            chunk_text = " ".join(words[start:end])
+
+            if chunk_text.strip():
+                chunks.append({
+                    "text": chunk_text,
+                    "page_number": page_number
+                })
+
+            if end >= len(words):
+                break
+
+            start = end - overlap
+
+    return chunks
+
+# 8. Retrieve the most relevant chunks for a question using semantic search
+def retrieve_chunks(question, top_k=3, db_client=None):
+    client = db_client if db_client is not None else load_database()
+    collection = get_existing_collection(client, COLLECTION_NAME)
+    if collection is None:
+        raise ValueError("Document collection not found. Please upload and index a PDF first.")
+
+    total_chunks = collection.count()
+    if total_chunks == 0:
+        raise ValueError("The document collection is empty. Please upload and index a PDF first.")
+
+    # Convert the question into an embedding vector
+    model = load_embedding_model()
+
+    question_embedding = model.encode(
+        [question],
+        normalize_embeddings=True
+    ).tolist()
+
+    # Search ChromaDB for the closest matching chunks
+    n_results = min(top_k, total_chunks)
+    results = collection.query(
+        query_embeddings=question_embedding,
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+
+    return results
+
+# 9. Generate an answer with Ollama using only the retrieved context
 def generate_answer(question, context):
     prompt = f"""
-    You are a helpful assistant answering questions about a PDF.
+    You are a helpful assistant answering questions about a PDF study material.
 
     Answer using only the context provided below.
     If the answer is not present in the context,
-    say that you could not find the answer in the PDF.
+    say that you could not find the answer in the study material.
 
     Context:
     {context}
@@ -59,210 +139,386 @@ def generate_answer(question, context):
 
     return response["message"]["content"]
 
-# Step 7: Retrieve relevant chunks
-def retrieve_chunks(question, top_k=3):
-    # Load the embedding model
-    model = load_embedding_model()
+# UI styling: keep the Learnly AI design separate from the RAG logic
+def inject_learnly_theme():
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
-    # Convert the question into a vector
-    question_embedding = model.encode(
-        [question],
-        normalize_embeddings=True
-    ).tolist()
+        html, body, [data-testid="stAppViewContainer"] {
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+            background: linear-gradient(135deg, #f7f5fd 0%, #faf9fe 50%, #f4f0fc 100%) !important;
+            color: #18181b !important;
+        }
 
-    # Access the stored PDF chunks
-    collection = db.get_collection("pdf_documents")
+        [data-testid="stMainBlockContainer"] {
+            max-width: 840px !important;
+            padding: 2.5rem 3rem 4rem 3rem !important;
+            background: #ffffff !important;
+            border-radius: 28px !important;
+            border: 1px solid #ebe6f7 !important;
+            box-shadow: 0 16px 48px rgba(139, 92, 246, 0.05), 0 2px 8px rgba(0, 0, 0, 0.02) !important;
+            margin: 2.5rem auto !important;
+        }
 
-    # Search for the most relevant chunks
-    results = collection.query(
-        query_embeddings=question_embedding,
-        n_results=min(top_k, collection.count()),
-        include=["documents", "metadatas", "distances"]
+        .learnly-orb-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding-top: 6px;
+            padding-bottom: 12px;
+        }
+        .learnly-orb {
+            width: 76px;
+            height: 76px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 35% 30%, #ffffff 0%, #f3e8ff 22%, #d8b4fe 45%, #a855f7 75%, #7e22ce 100%);
+            box-shadow: 0 0 42px rgba(168, 85, 247, 0.38),
+                        0 0 14px rgba(192, 132, 252, 0.55),
+                        inset 0 0 18px rgba(255, 255, 255, 0.7);
+            filter: drop-shadow(0 8px 20px rgba(147, 51, 234, 0.25));
+            animation: orb-pulse 4s ease-in-out infinite alternate;
+        }
+        @keyframes orb-pulse {
+            0% { transform: translateY(0px) scale(1); box-shadow: 0 0 40px rgba(168, 85, 247, 0.38); }
+            100% { transform: translateY(-5px) scale(1.02); box-shadow: 0 0 54px rgba(168, 85, 247, 0.54); }
+        }
+
+        .learnly-header {
+            text-align: center;
+            margin-bottom: 4px;
+        }
+        .learnly-title {
+            color: #111827;
+            font-size: 2.1rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            margin-bottom: 4px;
+        }
+        .learnly-tagline {
+            color: #7c3aed;
+            font-size: 1.05rem;
+            font-weight: 500;
+            letter-spacing: -0.01em;
+            margin-bottom: 28px;
+        }
+        .learnly-description {
+            max-width: 620px;
+            margin: 0 auto 30px auto;
+            color: #6b7280;
+            font-size: 1rem;
+            line-height: 1.7;
+            font-weight: 400;
+            text-align: center;
+        }
+
+        .learnly-card {
+            background: #ffffff;
+            border: 1px solid #ede8f7;
+            border-radius: 20px;
+            padding: 22px 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 18px rgba(139, 92, 246, 0.03);
+        }
+
+        button[kind="primary"] {
+            background: #8b5cf6 !important;
+            color: #ffffff !important;
+            border-radius: 12px !important;
+            border: none !important;
+            font-weight: 600 !important;
+            font-size: 0.95rem !important;
+            padding: 0.6rem 1.4rem !important;
+            box-shadow: 0 4px 14px rgba(124, 58, 237, 0.25) !important;
+            transition: all 0.2s ease !important;
+        }
+        button[kind="primary"]:hover {
+            background: #7c3aed !important;
+            box-shadow: 0 6px 18px rgba(124, 58, 237, 0.35) !important;
+            transform: translateY(-1px);
+        }
+
+        div[data-baseweb="input"] {
+            border-radius: 14px !important;
+            border: 1.5px solid #ebe5f7 !important;
+            background: #faf9fd !important;
+            transition: all 0.2s ease !important;
+        }
+        div[data-baseweb="input"]:focus-within {
+            border-color: #8b5cf6 !important;
+            background: #ffffff !important;
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15) !important;
+        }
+
+        div[data-testid="stExpander"] {
+            border-radius: 14px !important;
+            border: 1px solid #ede8f7 !important;
+            background: #faf9fd !important;
+            margin-bottom: 10px !important;
+        }
+        div[data-testid="stExpander"] summary {
+            font-weight: 600 !important;
+            color: #1f2937 !important;
+            padding: 10px 14px !important;
+        }
+        div[data-testid="stExpander"] summary:hover {
+            color: #7c3aed !important;
+        }
+
+        [data-testid="stFileUploaderDropzoneInstructions"] small,
+        section[data-testid="stFileUploaderDropzone"] small {
+            font-size: 0 !important;
+            visibility: hidden !important;
+            position: relative !important;
+        }
+        
+        </style>
+        """,
+        unsafe_allow_html=True
     )
 
-    return results
+# 10. Streamlit application: upload a PDF, ask questions, and show answers
+def main():
+    st.set_page_config(
+        page_title="Learnly AI | Study Materials. Smarter Answers.",
+        page_icon="📖",
+        layout="centered",
+        initial_sidebar_state="collapsed"
+    )
 
+    # Apply the existing UI theme and connect to the database
+    inject_learnly_theme()
 
+    db = load_database()
 
-# 3. Split text into chunks
-def split_into_chunks(text, chunk_size=100, overlap=20):
-    words = text.split()
-    chunks = []
-    start = 0
+    if "last_answer" not in st.session_state:
+        st.session_state["last_answer"] = None
+    if "last_results" not in st.session_state:
+        st.session_state["last_results"] = None
+    if "ollama_error" not in st.session_state:
+        st.session_state["ollama_error"] = None
+    if "indexed_filename" not in st.session_state:
+        st.session_state["indexed_filename"] = None
 
-    while start < len(words):
-        end = start + chunk_size
-        chunks.append(" ".join(words[start:end]))
+    st.markdown(
+        """
+        <div class="learnly-orb-container">
+            <div class="learnly-orb"></div>
+        </div>
+        <div class="learnly-header">
+            <div class="learnly-title">Learnly AI</div>
+            <div class="learnly-tagline">Your study materials. Smarter answers.</div>
+            <div class="learnly-description">Upload your notes, textbooks, and study PDFs. Ask questions and get AI-generated answers grounded in your materials, with page references.</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-        if end >= len(words):
-            break
+    # 5. Upload a PDF and extract its text page by page
+    st.markdown("### 📄 Upload Study Materials")
+    uploaded_file = st.file_uploader(
+        "Upload Study Materials",
+        type=["pdf"],
+        label_visibility="collapsed",
+        help="Upload your study materials in PDF format."
+    )
 
-        start = end - overlap
+    if uploaded_file is not None:
+        file_col, action_col = st.columns([3, 1])
+        with file_col:
+            st.markdown(
+                f"""
+                <div style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:#faf9fe; border:1px solid #ede8f7; border-radius:10px; font-size:0.9rem; color:#374151;">
+                    <span>📎</span> <strong>{uploaded_file.name}</strong>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        with action_col:
+            process_clicked = st.button("Process PDF", type="primary", use_container_width=True)
 
-    return chunks
-
-
-# 4. Upload PDF
-uploaded_file = st.file_uploader(
-    "Choose your PDF",
-    type=["pdf"]
-)
-
-if uploaded_file is not None:
-    pdf_bytes = uploaded_file.getvalue()
-
-    # 5. Extract text page by page
-    with fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    ) as document:
-        page_texts = [
-            page.get_text("text")
-            for page in document
-        ]
-        total_pages = len(document)
-
-    full_text = "\n".join(page_texts)
-
-    if not full_text.strip():
-        st.warning("No readable text found in this PDF.")
-
-    else:
-        st.success("PDF text extracted successfully!")
-        st.write("Total pages:", total_pages)
-
-        # 6. Create chunks
-        chunks = split_into_chunks(full_text)
-
-        st.write("Total words:", len(full_text.split()))
-        st.write("Total chunks:", len(chunks))
-
-        # 7. Generate embeddings and store in ChromaDB
-        if st.button("Store in ChromaDB", type="primary"):
+        if process_clicked:
             try:
-                with st.spinner(
-                    "Generating embeddings and storing chunks..."
-                ):
-                    model = load_embedding_model()
+                with st.spinner("Processing study materials..."):
+                    pdf_bytes = uploaded_file.getvalue()
 
-                    embeddings = model.encode(
-                        chunks,
-                        normalize_embeddings=True,
-                        show_progress_bar=False
-                    ).tolist()
+                    # Extract text from every page in the uploaded PDF
+                    with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+                        raw_page_texts = [page.get_text("text") for page in document]
 
-                    # Create a collection for this PDF
-                    collection_name = "pdf_documents"
+                    # Clean the extracted text before splitting it into chunks
+                    cleaned_page_texts = [clean_pdf_text(t) for t in raw_page_texts]
+                    full_text = "\n".join(cleaned_page_texts)
 
-                    # Replace the previous collection on re-indexing
-                    try:
-                        db.delete_collection(collection_name)
-                    except Exception:
-                        pass
+                    if not full_text.strip():
+                        st.warning("⚠️ No readable text found in this PDF. It may be scanned or empty.")
+                    else:
+                        # 6. Create chunks and keep their original page numbers
+                        chunks = create_page_chunks(cleaned_page_texts, chunk_size=100, overlap=20)
+                        chunk_texts = [chunk["text"] for chunk in chunks]
 
-                    collection = db.create_collection(
-                        name=collection_name,
-                        metadata={"hnsw:space": "cosine"}
-                    )
+                        # 7. Convert each chunk into an embedding vector
+                        model = load_embedding_model()
+                        embeddings = model.encode(
+                            chunk_texts,
+                            normalize_embeddings=True,
+                            show_progress_bar=False
+                        ).tolist()
 
-                    # Store chunks, embeddings and metadata
-                    collection.add(
-                        ids=[
-                            f"chunk_{i}"
-                            for i in range(len(chunks))
-                        ],
-                        documents=chunks,
-                        embeddings=embeddings,
-                        metadatas=[
-                            {
-                                "source": uploaded_file.name,
-                                "chunk_number": i + 1
-                            }
-                            for i in range(len(chunks))
-                        ]
-                    )
+                        # Replace the previous indexed PDF with this PDF
+                        try:
+                            db.delete_collection(COLLECTION_NAME)
+                        except Exception:
+                            pass
 
-                st.session_state["indexed"] = True
-                st.session_state["indexed_filename"] = (
-                    uploaded_file.name
-                )
+                        collection = db.create_collection(
+                            name=COLLECTION_NAME,
+                            metadata={"hnsw:space": "cosine"}
+                        )
 
-                st.success(
-                    f"Successfully stored {len(chunks)} chunks!"
-                )
+                        # Store chunk text, embeddings, and source/page metadata
+                        collection.add(
+                            ids=[f"chunk_{i}" for i in range(len(chunks))],
+                            documents=chunk_texts,
+                            embeddings=embeddings,
+                            metadatas=[
+                                {
+                                    "source": uploaded_file.name,
+                                    "chunk_number": i + 1,
+                                    "page_number": chunk["page_number"]
+                                }
+                                for i, chunk in enumerate(chunks)
+                            ]
+                        )
 
-            except Exception as error:
-                st.error(f"Indexing failed: {error}")
+                        st.session_state["indexed_filename"] = uploaded_file.name
+                        st.success(f"✅ Study materials processed and ready!")
+            except Exception as e:
+                st.error(f"❌ Processing failed: {e}")
 
-        # 8. Show stored data
-        if (
-            st.session_state.get("indexed")
-            and st.session_state.get("indexed_filename")
-            == uploaded_file.name
-        ):
-            try:
-                collection = db.get_collection("pdf_documents")
+    elif st.session_state.get("indexed_filename"):
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:8px; padding:6px 10px; background:#f5f3ff; border:1px solid #ddd6fe; border-radius:10px; font-size:0.85rem; color:#6d28d9; margin-bottom:12px;">
+                <span>✓</span> Indexed study material: <strong>{st.session_state['indexed_filename']}</strong>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-                st.subheader("ChromaDB Storage")
-                st.write("Stored chunks:", collection.count())
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
-                if collection.count() > 0:
-                    stored_data = collection.get(
-                        limit=1,
-                        include=["documents", "metadatas"]
-                    )
+    # 8. Accept a question and retrieve relevant chunks from the indexed PDF
+    st.markdown("### 💬 Ask a Question")
+    top_k = st.selectbox(
+    "Retrieved passages",
+    options=[1, 2, 3, 4, 5, 6, 8, 10],
+    index=2,
+    help="Choose how many relevant passages Learnly AI should retrieve."
+    )
+    with st.form("learnly_query_form", clear_on_submit=False):
+        question_input = st.text_input(
+            "Ask anything about your study material...",
+            placeholder="Ask anything about your study material...",
+            label_visibility="collapsed"
+        )
+        submit_button = st.form_submit_button("Ask Learnly", type="primary", use_container_width=True)
 
-                    st.write("Example stored chunk:")
-                    st.write(stored_data["documents"][0])
+    if submit_button:
+        cleaned_question = question_input.strip()
+        if not cleaned_question:
+            st.warning("⚠️ Please enter a question about your study material.")
+        else:
+            st.session_state["last_answer"] = None
+            st.session_state["last_results"] = None
+            st.session_state["ollama_error"] = None
 
-                    st.write("Metadata:")
-                    st.json(stored_data["metadatas"][0])
+            collection = get_existing_collection(db, COLLECTION_NAME)
+            if collection is None:
+                st.info("ℹ️ Please upload study material and click **Process PDF** first.")
+            elif collection.count() == 0:
+                st.info("ℹ️ The study collection is currently empty. Please upload and process a PDF.")
+            else:
+                try:
+                    with st.spinner("Finding relevant concepts in your study material..."):
+                        results = retrieve_chunks(cleaned_question, top_k=top_k, db_client=db)
+                        st.session_state["last_results"] = results
 
-                    
-                    # Step 8: Search the stored PDF
-                    st.subheader("Ask a question about your PDF")
-
-                    question = st.text_input(
-                        "Enter your question",
-                        key="retrieval_question"
-                    )
-
-                    if st.button("Find relevant passages"):
-                        if question.strip():
+                    if (
+                        not results
+                        or not results.get("documents")
+                        or len(results["documents"]) == 0
+                        or len(results["documents"][0]) == 0
+                    ):
+                        st.warning("⚠️ No relevant concepts were found in the study material for this question.")
+                    else:
+                        # Combine retrieved chunks into the context for the language model
+                        context = "\n\n".join(results["documents"][0])
+                        with st.spinner("Generating answer..."):
                             try:
-                                results = retrieve_chunks(question)
-                                # Combine retrieved passages into one context
-                                context = "\n\n".join(results["documents"][0])
+                                answer = generate_answer(cleaned_question, context)
+                                st.session_state["last_answer"] = answer
+                            except Exception as ollama_err:
+                                st.session_state["ollama_error"] = str(ollama_err)
 
-                                # Generate an answer from the retrieved context
-                                with st.spinner("Generating answer with Ollama..."):
-                                    answer = generate_answer(question, context)
+                except Exception as retrieval_error:
+                    st.error(f"❌ Search failed: {retrieval_error}")
 
-                                st.subheader("🤖 AI Answer")
-                                st.write(answer)
+    # 11. Display the generated answer and the source passages with page numbers
+    if st.session_state.get("last_answer"):
+        st.markdown(
+            """
+            <div style="display:flex; align-items:center; gap:8px; margin-top:28px; margin-bottom:8px;">
+                <span style="font-size:1.15rem; font-weight:700; color:#111827;">💡 Answer</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        with st.container(border=True):
+            st.markdown(st.session_state["last_answer"])
+        st.write("")
 
-                                st.success("Retrieved relevant passages!")
+    elif st.session_state.get("ollama_error"):
+        err_str = st.session_state["ollama_error"]
+        st.markdown("### 💡 Answer")
+        if "connect" in err_str.lower() or "connection" in err_str.lower() or "11434" in err_str:
+            st.error(
+                "⚠️ **Could not connect to Ollama.**\n\n"
+                "Please make sure the Ollama service is running locally (`ollama serve`). "
+                "Retrieved passages from your study material are still displayed below."
+            )
+        elif "not found" in err_str.lower() or "model" in err_str.lower():
+            st.error(
+                "⚠️ **Llama 3.2 model not found in Ollama.**\n\n"
+                "Please run `ollama pull llama3.2` to download the model."
+            )
+        else:
+            st.error(f"⚠️ **Generation error:** {err_str}")
 
-                                for i, text in enumerate(
-                                    results["documents"][0],
-                                    start=1
-                                ):
-                                    metadata = results["metadatas"][0][i - 1]
-                                    distance = results["distances"][0][i - 1]
+    results = st.session_state.get("last_results")
+    if results and results.get("documents") and len(results["documents"]) > 0:
+        documents = results["documents"][0]
+        metadatas = results["metadatas"][0] if results.get("metadatas") else [{}] * len(documents)
 
-                                    st.markdown(f"### Result {i}")
-                                    st.write(text)
-                                    st.caption(
-                                        f"Source: {metadata['source']} | "
-                                        f"Chunk: {metadata['chunk_number']} | "
-                                        f"Cosine distance: {distance:.4f}"
-                                    )
+        if len(documents) > 0:
+            st.markdown(
+                """
+                <div style="display:flex; align-items:center; gap:8px; margin-top:22px; margin-bottom:10px;">
+                    <span style="font-size:1.05rem; font-weight:700; color:#111827;">📚 Source References</span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
-                            except Exception as error:
-                                st.error(f"Retrieval failed: {error}")
-                        else:
-                            st.warning("Please enter a question.")
+            for idx, (doc_text, metadata) in enumerate(zip(documents, metadatas), start=1):
+                source_file = metadata.get("source", "Study Material")
+                page_num = metadata.get("page_number", "N/A")
 
+                expander_title = f"📄 {source_file} — Page {page_num}"
 
-            except Exception as error:
-                st.error(f"Could not read stored data: {error}")
+                with st.expander(expander_title, expanded=(idx == 1)):
+                    st.write(doc_text)
+
+if __name__ == "__main__":
+    main()
