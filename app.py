@@ -283,7 +283,7 @@ def inject_learnly_theme():
 # 10. Streamlit application: upload a PDF, ask questions, and show answers
 def main():
     st.set_page_config(
-        page_title="Learnly AI | Study Materials. Smarter Answers.",
+        page_title="Learnly AI",
         page_icon="📖",
         layout="centered",
         initial_sidebar_state="collapsed"
