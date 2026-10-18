@@ -1,6 +1,7 @@
 
 import streamlit as st
 import fitz
+import chromadb
 from sentence_transformers import SentenceTransformer
 
 st.set_page_config(
@@ -9,16 +10,27 @@ st.set_page_config(
 )
 
 st.title("📚 My First RAG Project")
-st.write("Upload a PDF, split its text, and generate embeddings.")
+st.write("Extract, chunk, embed, and store PDF text.")
 
 
-# Step 1: Load the embedding model
+# 1. Load the embedding model
 @st.cache_resource
 def load_embedding_model():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return SentenceTransformer(
+        "sentence-transformers/all-MiniLM-L6-v2"
+    )
 
 
-# Step 2: Split text into chunks
+# 2. Create a persistent ChromaDB database
+@st.cache_resource
+def load_database():
+    return chromadb.PersistentClient(path="./chroma_db")
+
+
+db = load_database()
+
+
+# 3. Split text into chunks
 def split_into_chunks(text, chunk_size=100, overlap=20):
     words = text.split()
     chunks = []
@@ -26,9 +38,7 @@ def split_into_chunks(text, chunk_size=100, overlap=20):
 
     while start < len(words):
         end = start + chunk_size
-        chunk_words = words[start:end]
-
-        chunks.append(" ".join(chunk_words))
+        chunks.append(" ".join(words[start:end]))
 
         if end >= len(words):
             break
@@ -38,7 +48,7 @@ def split_into_chunks(text, chunk_size=100, overlap=20):
     return chunks
 
 
-# Step 3: Upload PDF
+# 4. Upload PDF
 uploaded_file = st.file_uploader(
     "Choose your PDF",
     type=["pdf"]
@@ -47,8 +57,11 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
     pdf_bytes = uploaded_file.getvalue()
 
-    # Step 4: Extract text
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+    # 5. Extract text page by page
+    with fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    ) as document:
         page_texts = [
             page.get_text("text")
             for page in document
@@ -58,54 +71,98 @@ if uploaded_file is not None:
     full_text = "\n".join(page_texts)
 
     if not full_text.strip():
-        st.warning(
-            "No readable text found. Try a text-based PDF."
-        )
+        st.warning("No readable text found in this PDF.")
+
     else:
         st.success("PDF text extracted successfully!")
         st.write("Total pages:", total_pages)
 
-        # Step 5: Create chunks
-        chunks = split_into_chunks(
-            full_text,
-            chunk_size=100,
-            overlap=20
-        )
+        # 6. Create chunks
+        chunks = split_into_chunks(full_text)
 
-        st.subheader("Chunking Results")
         st.write("Total words:", len(full_text.split()))
         st.write("Total chunks:", len(chunks))
 
-        # Step 6: Generate embeddings when requested
-        if st.button("Generate Embeddings", type="primary"):
-            with st.spinner("Loading model and generating embeddings..."):
-                model = load_embedding_model()
+        # 7. Generate embeddings and store in ChromaDB
+        if st.button("Store in ChromaDB", type="primary"):
+            try:
+                with st.spinner(
+                    "Generating embeddings and storing chunks..."
+                ):
+                    model = load_embedding_model()
 
-                embeddings = model.encode(
-                    chunks,
-                    normalize_embeddings=True,
-                    show_progress_bar=False
+                    embeddings = model.encode(
+                        chunks,
+                        normalize_embeddings=True,
+                        show_progress_bar=False
+                    ).tolist()
+
+                    # Create a collection for this PDF
+                    collection_name = "pdf_documents"
+
+                    # Replace the previous collection on re-indexing
+                    try:
+                        db.delete_collection(collection_name)
+                    except Exception:
+                        pass
+
+                    collection = db.create_collection(
+                        name=collection_name,
+                        metadata={"hnsw:space": "cosine"}
+                    )
+
+                    # Store chunks, embeddings and metadata
+                    collection.add(
+                        ids=[
+                            f"chunk_{i}"
+                            for i in range(len(chunks))
+                        ],
+                        documents=chunks,
+                        embeddings=embeddings,
+                        metadatas=[
+                            {
+                                "source": uploaded_file.name,
+                                "chunk_number": i + 1
+                            }
+                            for i in range(len(chunks))
+                        ]
+                    )
+
+                st.session_state["indexed"] = True
+                st.session_state["indexed_filename"] = (
+                    uploaded_file.name
                 )
 
-            st.success("Embeddings generated successfully!")
+                st.success(
+                    f"Successfully stored {len(chunks)} chunks!"
+                )
 
-            st.write("Number of chunks embedded:", len(embeddings))
-            st.write("Dimensions per embedding:", embeddings.shape[1])
+            except Exception as error:
+                st.error(f"Indexing failed: {error}")
 
-            # Display one example
-            st.subheader("Embedding Preview")
-            st.write("First chunk:")
-            st.write(chunks[0])
+        # 8. Show stored data
+        if (
+            st.session_state.get("indexed")
+            and st.session_state.get("indexed_filename")
+            == uploaded_file.name
+        ):
+            try:
+                collection = db.get_collection("pdf_documents")
 
-            st.write("First 10 numbers in its embedding:")
-            st.code(str(embeddings[0][:10].tolist()))
+                st.subheader("ChromaDB Storage")
+                st.write("Stored chunks:", collection.count())
 
-            # Store results for display during subsequent reruns
-            st.session_state["chunks"] = chunks
-            st.session_state["embeddings"] = embeddings.tolist()
+                if collection.count() > 0:
+                    stored_data = collection.get(
+                        limit=1,
+                        include=["documents", "metadatas"]
+                    )
 
-        # Display chunk previews
-        with st.expander("View text chunks"):
-            for index, chunk in enumerate(chunks):
-                st.markdown(f"**Chunk {index + 1}**")
-                st.write(chunk)
+                    st.write("Example stored chunk:")
+                    st.write(stored_data["documents"][0])
+
+                    st.write("Metadata:")
+                    st.json(stored_data["metadatas"][0])
+
+            except Exception as error:
+                st.error(f"Could not read stored data: {error}")
